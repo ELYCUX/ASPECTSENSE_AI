@@ -1,0 +1,30 @@
+Flask==3.0.3
+Flask-Cors==4.0.1
+Flask-Caching==2.3.0
+pg8000==1.31.2
+PyJWT==2.8.0
+bcrypt==4.1.3
+python-dotenv==1.0.1
+requests==2.32.3
+
+# NLP
+spacy==3.7.5
+transformers==4.44.2
+torch==2.4.1
+sentencepiece==0.2.0
+
+# LangChain
+langchain==0.2.16
+langchain-openai==0.1.23
+langchain-google-genai==1.0.10
+langchain-community==0.2.16
+
+# Reports
+reportlab==4.2.2
+openpyxl==3.1.5
+pandas==2.2.2
+numpy==1.26.4
+
+# Background jobs (optional - comment out if Redis not available)
+celery==5.4.0
+redis==5.0.8
