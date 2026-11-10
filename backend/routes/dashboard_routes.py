@@ -1,10 +1,11 @@
 """
-Optimized Dashboard Routes — Single aggregate SQL query with Flask-Caching.
-Target: ~200-500ms warm response for typical databases.
+Optimized Dashboard Routes — Single consolidated aggregate PostgreSQL query with in-memory caching.
+Target: ~1-2s cold response across international Supabase SSL, ~1ms warm response.
 """
 import time
+import json
 import logging
-from flask import Blueprint, jsonify, current_app
+from flask import Blueprint, jsonify, request, g
 from middleware.auth import token_required
 from config.db import execute_query
 from services.metrics_service import calculate_product_health_score, calculate_business_priority
@@ -12,110 +13,154 @@ from services.metrics_service import calculate_product_health_score, calculate_b
 logger = logging.getLogger(__name__)
 dashboard_bp = Blueprint('dashboard', __name__)
 
-# Simple in-process cache (fallback if Flask-Caching not configured)
-_cache = {}
+_dashboard_cache = {}
 CACHE_TTL = 30  # seconds
 
 
-def _get_cached(key):
-    entry = _cache.get(key)
+def _get_cached(user_id):
+    entry = _dashboard_cache.get(user_id)
     if entry:
-        import time as t
-        if t.time() - entry['ts'] < CACHE_TTL:
+        if time.time() - entry['ts'] < CACHE_TTL:
             return entry['data']
     return None
 
 
-def _set_cached(key, data):
-    import time as t
-    _cache[key] = {'data': data, 'ts': t.time()}
+def _set_cached(user_id, data):
+    _dashboard_cache[user_id] = {'data': data, 'ts': time.time()}
 
 
 def invalidate_dashboard_cache():
     """Call this when reviews or products change."""
-    _cache.clear()
+    _dashboard_cache.clear()
 
 
 @dashboard_bp.route('/stats', methods=['GET'])
 @token_required
 def get_stats():
     t0 = time.time()
+    user_id = g.user.get('id', 0)
+    is_admin = g.user.get('role') == 'admin'
+    force_refresh = request.args.get('refresh') == 'true'
 
-    # Try cache first
-    cached = _get_cached('dashboard_stats')
-    if cached:
-        logger.info(f"Dashboard stats served from cache in {(time.time()-t0)*1000:.1f}ms")
-        return jsonify({'success': True, 'data': cached, 'cached': True}), 200
+    cache_key = 'admin' if is_admin else f'user_{user_id}'
+
+    # Check cache
+    if not force_refresh:
+        cached = _get_cached(cache_key)
+        if cached:
+            return jsonify({'success': True, 'data': cached, 'cached': True}), 200
 
     try:
-        # ============================================================
-        # SINGLE OPTIMIZED AGGREGATE QUERY — replaces 6+ separate calls
-        # ============================================================
-        agg = execute_query("""
-            SELECT
-                COUNT(*)::int                                              AS total_reviews,
-                ROUND(AVG(rating)::numeric, 1)::float                     AS avg_rating,
-                COUNT(*) FILTER (WHERE sentiment = 'positive')::int       AS positive,
-                COUNT(*) FILTER (WHERE sentiment = 'negative')::int       AS negative,
-                COUNT(*) FILTER (WHERE sentiment = 'neutral')::int        AS neutral
-            FROM reviews
-        """, fetch_one=True)
+        # Build role-aware user filter clause
+        if is_admin:
+            user_rev_filter = "1=1"
+            user_prod_filter = "1=1"
+            params = []
+        else:
+            # For normal users: access their own records or shared system records
+            user_rev_filter = "(user_id = $1 OR is_shared = TRUE OR user_id IS NULL)"
+            user_prod_filter = "(user_id = $1 OR is_shared = TRUE OR user_id IS NULL)"
+            params = [user_id]
 
-        total_reviews = agg.get('total_reviews', 0) if agg else 0
-        avg_rating = float(agg.get('avg_rating') or 0) if agg else 0.0
-        positive = agg.get('positive', 0) if agg else 0
-        negative = agg.get('negative', 0) if agg else 0
-        neutral = agg.get('neutral', 0) if agg else 0
+        query = f"""
+        SELECT json_build_object(
+            'kpi', (
+                SELECT json_build_object(
+                    'total_reviews', COUNT(*)::int,
+                    'avg_rating', COALESCE(ROUND(AVG(rating)::numeric, 1)::float, 0.0),
+                    'positive', COUNT(*) FILTER (WHERE sentiment = 'positive')::int,
+                    'negative', COUNT(*) FILTER (WHERE sentiment = 'negative')::int,
+                    'neutral', COUNT(*) FILTER (WHERE sentiment = 'neutral')::int
+                ) FROM reviews WHERE {user_rev_filter}
+            ),
+            'total_products', (
+                SELECT COUNT(*)::int FROM products WHERE {user_prod_filter}
+            ),
+            'rating_distribution', (
+                SELECT COALESCE(json_agg(rd), '[]'::json) FROM (
+                    SELECT rating || '★' as rating, COUNT(*)::int as count 
+                    FROM reviews 
+                    WHERE {user_rev_filter} AND rating IS NOT NULL
+                    GROUP BY rating ORDER BY rating
+                ) rd
+            ),
+            'monthly_reviews', (
+                SELECT COALESCE(json_agg(mr), '[]'::json) FROM (
+                    SELECT TO_CHAR(created_at, 'Mon') as month, 
+                           EXTRACT(MONTH FROM created_at)::int as month_num, 
+                           COUNT(*)::int as reviews
+                    FROM reviews
+                    WHERE {user_rev_filter} AND created_at >= NOW() - INTERVAL '6 months'
+                    GROUP BY TO_CHAR(created_at, 'Mon'), EXTRACT(MONTH FROM created_at)
+                    ORDER BY month_num
+                ) mr
+            ),
+            'top_products', (
+                SELECT COALESCE(json_agg(tp), '[]'::json) FROM (
+                    SELECT p.id, p.name, p.brand,
+                           COALESCE(ROUND(p.avg_rating::numeric, 1)::float, 0.0) as avg_rating,
+                           COALESCE(p.review_count, 0) as review_count,
+                           COUNT(r.id) FILTER (WHERE r.sentiment = 'positive')::int as positive_count
+                    FROM products p
+                    LEFT JOIN reviews r ON r.product_id = p.id
+                    WHERE {user_prod_filter}
+                    GROUP BY p.id, p.name, p.brand, p.avg_rating, p.review_count
+                    ORDER BY p.avg_rating DESC NULLS LAST, p.review_count DESC
+                    LIMIT 5
+                ) tp
+            ),
+            'aspect_rows', (
+                SELECT COALESCE(json_agg(a.aspects), '[]'::json) FROM (
+                    SELECT aspects FROM reviews 
+                    WHERE {user_rev_filter} AND aspects IS NOT NULL 
+                    ORDER BY created_at DESC LIMIT 80
+                ) a
+            )
+        ) as payload;
+        """
 
-        # Product count
-        prod_count = execute_query("SELECT COUNT(*)::int AS cnt FROM products", fetch_one=True)
-        total_products = prod_count.get('cnt', 0) if prod_count else 0
+        raw_result = execute_query(query, params if params else None, fetch_one=True)
+        payload = raw_result.get('payload', {}) if raw_result else {}
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+
+        kpi_data = payload.get('kpi', {})
+        total_reviews = kpi_data.get('total_reviews', 0)
+        avg_rating = float(kpi_data.get('avg_rating', 0.0))
+        positive = kpi_data.get('positive', 0)
+        negative = kpi_data.get('negative', 0)
+        neutral = kpi_data.get('neutral', 0)
+        total_products = payload.get('total_products', 0)
 
         # Rating distribution
-        rating_dist_rows = execute_query(
-            "SELECT rating, COUNT(*)::int AS count FROM reviews GROUP BY rating ORDER BY rating",
-            fetch_all=True
-        )
-        rating_distribution = [
-            {'rating': f"{r['rating']}★", 'count': r['count']}
-            for r in rating_dist_rows
-        ]
+        rating_distribution = payload.get('rating_distribution', [])
+        if not rating_distribution:
+            rating_distribution = [{'rating': f'{i}★', 'count': 0} for i in range(1, 6)]
 
-        # Monthly reviews (last 6 months) — optimized query
-        monthly_rows = execute_query("""
-            SELECT TO_CHAR(created_at, 'Mon') AS month,
-                   EXTRACT(MONTH FROM created_at)::int AS month_num,
-                   COUNT(*)::int AS count
-            FROM reviews
-            WHERE created_at >= NOW() - INTERVAL '6 months'
-            GROUP BY TO_CHAR(created_at, 'Mon'), EXTRACT(MONTH FROM created_at)
-            ORDER BY month_num
-        """, fetch_all=True)
-        monthly_reviews = [{'month': r['month'], 'reviews': r['count']} for r in monthly_rows]
+        # Monthly reviews
+        monthly_reviews = payload.get('monthly_reviews', [])
 
-        # Aspect sentiment — computed via SQL JSON aggregation or Python (limited rows)
-        aspect_rows = execute_query(
-            "SELECT aspects FROM reviews WHERE aspects IS NOT NULL LIMIT 2000",
-            fetch_all=True
-        )
-        import json as _json
+        # Process aspect sentiment from top 80 aspect JSON rows
         aspect_map = {}
-        for row in aspect_rows:
-            raw = row.get('aspects')
-            if not raw:
+        for raw_asp in payload.get('aspect_rows', []):
+            if not raw_asp:
                 continue
-            if isinstance(raw, str):
+            if isinstance(raw_asp, str):
                 try:
-                    aspects = _json.loads(raw)
+                    aspects = json.loads(raw_asp)
                 except Exception:
                     continue
             else:
-                aspects = raw
-            for asp, sent in aspects.items():
-                if asp not in aspect_map:
-                    aspect_map[asp] = {'positive': 0, 'negative': 0, 'neutral': 0}
-                if sent in aspect_map[asp]:
-                    aspect_map[asp][sent] += 1
+                aspects = raw_asp
+
+            if isinstance(aspects, dict):
+                for asp, sent in aspects.items():
+                    if isinstance(sent, dict):
+                        sent = sent.get('sentiment', 'neutral')
+                    if asp not in aspect_map:
+                        aspect_map[asp] = {'positive': 0, 'negative': 0, 'neutral': 0}
+                    if sent in aspect_map[asp]:
+                        aspect_map[asp][sent] += 1
 
         aspect_sentiment = [
             {'aspect': a, **c}
@@ -127,23 +172,9 @@ def get_stats():
         ]
 
         # Top products
-        top_products = execute_query("""
-            SELECT p.id, p.name, p.brand,
-                   ROUND(p.avg_rating::numeric, 1)::float AS avg_rating,
-                   p.review_count,
-                   COUNT(r.id) FILTER (WHERE r.sentiment = 'positive')::int AS positive_count
-            FROM products p
-            LEFT JOIN reviews r ON r.product_id = p.id
-            GROUP BY p.id, p.name, p.brand, p.avg_rating, p.review_count
-            ORDER BY p.avg_rating DESC NULLS LAST, p.review_count DESC
-            LIMIT 5
-        """, fetch_all=True)
+        top_products = payload.get('top_products', [])
 
-        for p in top_products:
-            if p.get('avg_rating'):
-                p['avg_rating'] = float(p['avg_rating'])
-
-        # Health score and business priority
+        # Health score & business priority
         health_metrics = {
             'avg_rating': avg_rating,
             'review_count': total_reviews,
@@ -151,9 +182,8 @@ def get_stats():
             'negative_reviews': negative
         }
         health_score_data = calculate_product_health_score(health_metrics)
-        monthly_freq = monthly_rows[-1]['count'] if monthly_rows else 0
+        monthly_freq = monthly_reviews[-1]['reviews'] if monthly_reviews else 0
         biz_priority = calculate_business_priority(avg_rating, monthly_freq, negative)
-
         ai_processed = int(total_reviews * 0.95)
 
         result = {
@@ -181,9 +211,9 @@ def get_stats():
             'businessPriority': biz_priority
         }
 
-        _set_cached('dashboard_stats', result)
+        _set_cached(cache_key, result)
         elapsed = (time.time() - t0) * 1000
-        logger.info(f"Dashboard stats computed in {elapsed:.1f}ms")
+        logger.info(f"Dashboard stats ({cache_key}) computed in {elapsed:.1f}ms")
 
         return jsonify({'success': True, 'data': result}), 200
 

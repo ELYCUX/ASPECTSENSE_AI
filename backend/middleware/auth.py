@@ -30,6 +30,8 @@ def token_required(f):
         token = None
         if auth_header and auth_header.startswith('Bearer '):
             token = auth_header.split(' ')[1]
+        elif request.args.get('token'):
+            token = request.args.get('token')
 
         if not token:
             return jsonify({'success': False, 'message': 'Access denied. No token provided.'}), 401
@@ -75,11 +77,17 @@ def admin_required(f):
         # Ensure token_required was run or run it
         if not hasattr(g, 'user') or not g.user:
             auth_header = request.headers.get('Authorization')
-            if not auth_header or not auth_header.startswith('Bearer '):
+            token = None
+            if auth_header and auth_header.startswith('Bearer '):
+                token = auth_header.split(' ')[1]
+            elif request.args.get('token'):
+                token = request.args.get('token')
+
+            if not token:
                 return jsonify({'success': False, 'message': 'Access denied. No token provided.'}), 401
             try:
                 jwt_secret = os.environ.get('JWT_SECRET', 'aspect_feedback_jwt_secret_key_2024')
-                decoded = jwt.decode(auth_header.split(' ')[1], jwt_secret, algorithms=['HS256'])
+                decoded = jwt.decode(token, jwt_secret, algorithms=['HS256'])
                 user = UserModel.find_by_id(decoded.get('id'))
                 if not user:
                     return jsonify({'success': False, 'message': 'User not found.'}), 401

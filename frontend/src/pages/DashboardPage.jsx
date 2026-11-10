@@ -13,7 +13,7 @@ import api from '../api/axios';
 import {
   MessageSquare, Package, Star, ThumbsUp, ThumbsDown, Cpu,
   RefreshCw, TrendingUp, ExternalLink, Clock, AlertCircle,
-  Activity, Database, Server, MapPin, Zap, Plus, Upload, FileText, Users, CheckCircle, ShieldCheck, User, Download
+  Activity, Database, Server, MapPin, Zap, Plus, Upload, FileText, Users, CheckCircle, ShieldCheck, User, Download, Loader2
 } from 'lucide-react';
 import { Link, useLocation } from 'react-router-dom';
 
@@ -32,9 +32,36 @@ export default function DashboardPage() {
   const [reviews, setReviews] = useState([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
+  const [exporting, setExporting] = useState(false);
 
   const location = useLocation();
   const [isBatchView, setIsBatchView] = useState(false);
+
+  const handleExportCSV = async () => {
+    setExporting(true);
+    try {
+      const response = await api.get('/reports/csv', { responseType: 'blob' });
+      const blob = new Blob([response.data], { type: 'text/csv;charset=utf-8;' });
+      const url = window.URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.setAttribute('download', `aspect_sense_reviews_${new Date().toISOString().slice(0, 10)}.csv`);
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.URL.revokeObjectURL(url);
+      addToast('CSV export downloaded successfully', 'success');
+    } catch (err) {
+      const token = localStorage.getItem('aspectai_token') || localStorage.getItem('token');
+      if (token) {
+        window.open(`${api.defaults.baseURL}/reports/csv?token=${token}`, '_blank');
+      } else {
+        addToast('Failed to export CSV report', 'error');
+      }
+    } finally {
+      setExporting(false);
+    }
+  };
 
   const loadData = async (isRefresh = false) => {
     // If refreshing from batch view, clear the state instead of fetching normally and keeping batch mode
@@ -112,13 +139,16 @@ export default function DashboardPage() {
               </div>
               <div className="hidden sm:flex items-center gap-3">
                 <button
-                  onClick={() => {
-                    const token = localStorage.getItem('token');
-                    window.open(`${api.defaults.baseURL}/reports/csv?token=${token}`, '_blank');
-                  }}
-                  className="glass-lighter text-gray-300 px-4 py-2 rounded-lg text-sm font-medium hover:bg-white/10 transition-colors flex items-center gap-2 shadow-sm border border-white/10"
+                  onClick={handleExportCSV}
+                  disabled={exporting}
+                  className="glass-lighter text-gray-300 px-4 py-2 rounded-lg text-sm font-medium hover:bg-white/10 transition-colors flex items-center gap-2 shadow-sm border border-white/10 disabled:opacity-50"
                 >
-                  <Download className="w-4 h-4" /> Export CSV
+                  {exporting ? (
+                    <Loader2 className="w-4 h-4 animate-spin text-primary-400" />
+                  ) : (
+                    <Download className="w-4 h-4" />
+                  )}
+                  Export CSV
                 </button>
                 <button
                   onClick={() => loadData(true)}
@@ -153,24 +183,34 @@ export default function DashboardPage() {
               </div>
               <div className="xl:col-span-4 flex flex-col gap-6">
                 {/* Product Health Card */}
-                <div className="card p-6 flex-1 flex flex-col justify-center relative overflow-hidden">
-                  <div className="absolute top-0 right-0 w-32 h-32 bg-emerald-500/10 rounded-bl-full -mr-10 -mt-10 pointer-events-none"></div>
-                  <h3 className="text-base font-semibold text-white mb-1 relative z-10">Product Health Score</h3>
-                  <p className="text-xs text-gray-400 mb-6 relative z-10">Based on rating, volume & recency</p>
-                  <div className="flex items-end gap-3 mb-6 relative z-10">
-                    <span className="text-5xl font-bold text-white tracking-tighter">
-                      {stats ? stats.healthScore.score : 0}
-                    </span>
-                    <span className="text-lg text-gray-500 font-medium mb-1">/ 100</span>
+                {loading ? (
+                  <div className="card p-6 flex-1 flex flex-col justify-center animate-pulse space-y-4">
+                    <div className="h-4 bg-surface-700/60 rounded w-1/3"></div>
+                    <div className="h-3 bg-surface-700/40 rounded w-1/2"></div>
+                    <div className="h-10 bg-surface-700/60 rounded w-2/5 mt-2"></div>
+                    <div className="h-2 bg-surface-700/50 rounded-full w-full"></div>
+                    <div className="h-4 bg-surface-700/40 rounded w-3/4"></div>
                   </div>
-                  <div className="h-2 w-full bg-surface-700 rounded-full overflow-hidden mb-2 relative z-10 border border-white/5">
-                    <div className={`h-full ${stats && stats.healthScore.score >= 80 ? 'bg-emerald-500 shadow-[0_0_10px_rgba(16,185,129,0.5)]' : stats && stats.healthScore.score >= 60 ? 'bg-amber-500 shadow-[0_0_10px_rgba(245,158,11,0.5)]' : 'bg-red-500 shadow-[0_0_10px_rgba(239,68,68,0.5)]'} rounded-full`} style={{ width: `${stats ? stats.healthScore.score : 0}%` }}></div>
+                ) : (
+                  <div className="card p-6 flex-1 flex flex-col justify-center relative overflow-hidden">
+                    <div className="absolute top-0 right-0 w-32 h-32 bg-emerald-500/10 rounded-bl-full -mr-10 -mt-10 pointer-events-none"></div>
+                    <h3 className="text-base font-semibold text-white mb-1 relative z-10">Product Health Score</h3>
+                    <p className="text-xs text-gray-400 mb-6 relative z-10">Based on rating, volume & recency</p>
+                    <div className="flex items-end gap-3 mb-6 relative z-10">
+                      <span className="text-5xl font-bold text-white tracking-tighter">
+                        {stats?.healthScore?.score ?? 0}
+                      </span>
+                      <span className="text-lg text-gray-500 font-medium mb-1">/ 100</span>
+                    </div>
+                    <div className="h-2 w-full bg-surface-700 rounded-full overflow-hidden mb-2 relative z-10 border border-white/5">
+                      <div className={`h-full ${stats && stats.healthScore?.score >= 80 ? 'bg-emerald-500 shadow-[0_0_10px_rgba(16,185,129,0.5)]' : stats && stats.healthScore?.score >= 60 ? 'bg-amber-500 shadow-[0_0_10px_rgba(245,158,11,0.5)]' : 'bg-red-500 shadow-[0_0_10px_rgba(239,68,68,0.5)]'} rounded-full`} style={{ width: `${stats?.healthScore?.score ?? 0}%` }}></div>
+                    </div>
+                    <p className={`text-xs font-medium relative z-10 ${stats && stats.healthScore?.score >= 80 ? 'text-emerald-400' : stats && stats.healthScore?.score >= 60 ? 'text-amber-400' : 'text-red-400'}`}>
+                      {stats?.healthScore?.status || 'Good'}
+                      <span className="ml-2 text-gray-400 font-normal border-l border-white/20 pl-2">Biz Priority: <strong className={stats?.businessPriority === 'Critical' ? 'text-red-500' : 'text-white'}>{stats?.businessPriority || 'Normal'}</strong></span>
+                    </p>
                   </div>
-                  <p className={`text-xs font-medium relative z-10 ${stats && stats.healthScore.score >= 80 ? 'text-emerald-400' : stats && stats.healthScore.score >= 60 ? 'text-amber-400' : 'text-red-400'}`}>
-                    {stats ? stats.healthScore.status : 'Loading...'}
-                    <span className="ml-2 text-gray-400 font-normal border-l border-white/20 pl-2">Biz Priority: <strong className={stats?.businessPriority === 'Critical' ? 'text-red-500' : 'text-white'}>{stats ? stats.businessPriority : ''}</strong></span>
-                  </p>
-                </div>
+                )}
               </div>
             </div>
 

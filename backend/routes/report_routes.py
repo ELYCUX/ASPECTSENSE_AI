@@ -7,7 +7,7 @@ import csv
 import json
 import datetime
 import logging
-from flask import Blueprint, jsonify, send_file, request
+from flask import Blueprint, jsonify, send_file, request, g
 from middleware.auth import token_required
 from config.db import execute_query
 
@@ -15,27 +15,29 @@ logger = logging.getLogger(__name__)
 report_bp = Blueprint('reports', __name__)
 
 
-def get_report_data(product_id=None):
+def get_report_data(product_id=None, user_id=None, is_admin=False):
     """Fetch data needed for reports."""
+    where_parts = []
+    params = []
+    
     if product_id:
-        reviews = execute_query(
-            """SELECT r.id, p.name as product_name, r.user_name, r.rating, r.sentiment, 
-                      r.body, r.created_at, r.aspects, r.source
-               FROM reviews r JOIN products p ON r.product_id = p.id
-               WHERE r.product_id = $1
-               ORDER BY r.created_at DESC""",
-            [product_id], fetch_all=True
-        )
-    else:
-        reviews = execute_query(
-            """SELECT r.id, p.name as product_name, r.user_name, r.rating, r.sentiment, 
-                      r.body, r.created_at, r.aspects, r.source
-               FROM reviews r JOIN products p ON r.product_id = p.id
-               ORDER BY r.created_at DESC
-               LIMIT 1000""",
-            fetch_all=True
-        )
-    return reviews
+        params.append(product_id)
+        where_parts.append(f"r.product_id = ${len(params)}")
+        
+    if not is_admin and user_id:
+        params.append(user_id)
+        where_parts.append(f"(r.user_id = ${len(params)} OR r.is_shared = TRUE OR r.user_id IS NULL)")
+        
+    where_clause = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+    
+    query = f"""SELECT r.id, COALESCE(p.name, 'General Product') as product_name, r.user_name, r.rating, r.sentiment, 
+                       r.body, r.created_at, r.aspects, r.source
+                FROM reviews r 
+                LEFT JOIN products p ON r.product_id = p.id
+                {where_clause}
+                ORDER BY r.created_at DESC
+                LIMIT 1000"""
+    return execute_query(query, params if params else None, fetch_all=True)
 
 
 def parse_aspects(aspects_raw):
@@ -55,7 +57,9 @@ def parse_aspects(aspects_raw):
 def export_csv():
     try:
         product_id = request.args.get('productId')
-        reviews = get_report_data(product_id)
+        user_id = g.user.get('id') if hasattr(g, 'user') and g.user else None
+        is_admin = (g.user.get('role') == 'admin') if hasattr(g, 'user') and g.user else False
+        reviews = get_report_data(product_id, user_id=user_id, is_admin=is_admin)
 
         output = io.StringIO()
         writer = csv.writer(output)
@@ -95,7 +99,9 @@ def export_excel():
         from openpyxl.utils import get_column_letter
 
         product_id = request.args.get('productId')
-        reviews = get_report_data(product_id)
+        user_id = g.user.get('id') if hasattr(g, 'user') and g.user else None
+        is_admin = (g.user.get('role') == 'admin') if hasattr(g, 'user') and g.user else False
+        reviews = get_report_data(product_id, user_id=user_id, is_admin=is_admin)
 
         wb = openpyxl.Workbook()
         ws = wb.active
@@ -186,7 +192,9 @@ def export_pdf():
         from reportlab.lib.enums import TA_CENTER, TA_LEFT
 
         product_id = request.args.get('productId')
-        reviews = get_report_data(product_id)
+        user_id = g.user.get('id') if hasattr(g, 'user') and g.user else None
+        is_admin = (g.user.get('role') == 'admin') if hasattr(g, 'user') and g.user else False
+        reviews = get_report_data(product_id, user_id=user_id, is_admin=is_admin)
 
         buf = io.BytesIO()
         doc = SimpleDocTemplate(buf, pagesize=A4, topMargin=20*mm, bottomMargin=20*mm,
