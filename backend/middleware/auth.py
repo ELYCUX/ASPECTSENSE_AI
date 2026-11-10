@@ -5,6 +5,24 @@ from flask import request, jsonify, g
 import jwt
 from models.user_model import UserModel
 
+_user_cache = {}
+USER_CACHE_TTL = 30  # seconds
+
+def get_cached_user(user_id):
+    entry = _user_cache.get(user_id)
+    if entry and (datetime.datetime.utcnow() - entry['ts']).total_seconds() < USER_CACHE_TTL:
+        return entry['user']
+    return None
+
+def set_cached_user(user_id, user):
+    _user_cache[user_id] = {'user': user, 'ts': datetime.datetime.utcnow()}
+
+def invalidate_user_cache(user_id=None):
+    if user_id:
+        _user_cache.pop(user_id, None)
+    else:
+        _user_cache.clear()
+
 def token_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
@@ -20,8 +38,13 @@ def token_required(f):
             jwt_secret = os.environ.get('JWT_SECRET', 'aspect_feedback_jwt_secret_key_2024')
             decoded = jwt.decode(token, jwt_secret, algorithms=['HS256'])
             
-            # Fetch fresh user profile from DB to prevent role tampering and enforce real-time status checks
-            user = UserModel.find_by_id(decoded.get('id'))
+            # Fetch user profile (cached 30s for ultra-fast response, invalidated on status/role changes)
+            user_id = decoded.get('id')
+            user = get_cached_user(user_id)
+            if not user:
+                user = UserModel.find_by_id(user_id)
+                if user:
+                    set_cached_user(user_id, user)
             if not user:
                 return jsonify({'success': False, 'message': 'User no longer exists.'}), 401
             

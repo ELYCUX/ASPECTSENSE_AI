@@ -1,4 +1,5 @@
 import datetime
+import json
 from flask import Blueprint, request, jsonify, g
 from middleware.auth import token_required
 from config.db import execute_query
@@ -12,22 +13,26 @@ def get_notifications():
         user_id = g.user['id']
         unread_only = request.args.get('unread', 'false').lower() == 'true'
 
-        query = 'SELECT * FROM user_notifications WHERE user_id = $1'
-        params = [user_id]
-        if unread_only:
-            query += ' AND is_read = FALSE'
-        query += ' ORDER BY created_at DESC LIMIT 20'
+        filter_clause = "AND is_read = FALSE" if unread_only else ""
 
-        notifications = execute_query(query, params, fetch_all=True) or []
-        for n in notifications:
-            if n.get('created_at') and isinstance(n['created_at'], datetime.datetime):
-                n['created_at'] = n['created_at'].isoformat()
+        # Single combined query for notifications + unread count
+        query = f"""
+            SELECT 
+                COUNT(*) FILTER (WHERE is_read = FALSE)::int AS unread_count,
+                COALESCE(json_agg(n ORDER BY created_at DESC), '[]'::json) AS notifications
+            FROM (
+                SELECT * FROM user_notifications 
+                WHERE user_id = $1 {filter_clause}
+                ORDER BY created_at DESC 
+                LIMIT 20
+            ) n
+        """
 
-        unread_count_res = execute_query(
-            'SELECT COUNT(*) FROM user_notifications WHERE user_id = $1 AND is_read = FALSE',
-            [user_id], fetch_one=True
-        )
-        unread_count = int(unread_count_res['count']) if unread_count_res else 0
+        res = execute_query(query, [user_id], fetch_one=True) or {}
+        unread_count = res.get('unread_count', 0)
+        notifications = res.get('notifications', [])
+        if isinstance(notifications, str):
+            notifications = json.loads(notifications)
 
         return jsonify({
             'success': True,
@@ -58,7 +63,7 @@ def mark_as_read(notification_id):
 
 @notification_bp.route('/read-all', methods=['PUT'])
 @token_required
-def mark_all_as_read():
+def mark_all_read():
     try:
         user_id = g.user['id']
         execute_query(

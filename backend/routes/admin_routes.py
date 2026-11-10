@@ -1,7 +1,7 @@
 import math
 import datetime
 from flask import Blueprint, request, jsonify, g
-from middleware.auth import token_required, admin_required
+from middleware.auth import token_required, admin_required, invalidate_user_cache
 from models.user_model import UserModel
 from config.db import execute_query
 
@@ -32,75 +32,103 @@ def log_activity(action, target_type=None, target_id=None, description='', metad
 # ============================================================
 # 1. ADMIN DASHBOARD STATS
 # ============================================================
+_admin_dashboard_cache = {}
+ADMIN_CACHE_TTL = 30  # seconds
+
+def get_cached_admin_dashboard():
+    entry = _admin_dashboard_cache.get('stats')
+    if entry and (datetime.datetime.utcnow() - entry['ts']).total_seconds() < ADMIN_CACHE_TTL:
+        return entry['data']
+    return None
+
+def set_cached_admin_dashboard(data):
+    _admin_dashboard_cache['stats'] = {'data': data, 'ts': datetime.datetime.utcnow()}
+
+def invalidate_admin_cache():
+    _admin_dashboard_cache.clear()
+
 @admin_bp.route('/dashboard', methods=['GET'])
 def get_admin_dashboard():
     try:
-        # User stats
-        user_stats = execute_query('''
-            SELECT 
-                COUNT(*) as total_users,
-                COUNT(*) FILTER (WHERE account_status = 'active') as active_users,
-                COUNT(*) FILTER (WHERE account_status = 'suspended') as suspended_users,
-                COUNT(*) FILTER (WHERE role = 'admin') as admin_users
-            FROM users
-        ''', fetch_one=True) or {}
+        # Check cache
+        force_refresh = request.args.get('refresh') == 'true'
+        if not force_refresh:
+            cached = get_cached_admin_dashboard()
+            if cached:
+                return jsonify({'success': True, 'data': cached, 'cached': True}), 200
 
-        # Content stats
-        content_stats = execute_query('''
-            SELECT 
-                (SELECT COUNT(*) FROM products) as total_products,
-                (SELECT COUNT(*) FROM reviews) as total_reviews,
-                (SELECT COUNT(*) FROM reviews WHERE source IN ('amazon', 'amazon_import')) as imported_reviews,
-                (SELECT COUNT(*) FROM reviews WHERE analysis_method IS NOT NULL) as analyzed_reviews,
-                (SELECT COUNT(*) FROM amazon_imports) as total_imports,
-                (SELECT COUNT(*) FROM analysis_jobs WHERE status = 'pending') as pending_jobs,
-                (SELECT COUNT(*) FROM analysis_jobs WHERE status = 'failed') as failed_jobs
-        ''', fetch_one=True) or {}
+        # Execute single optimized aggregate query — combines 7 sequential queries into 1 round-trip
+        query = '''
+        SELECT json_build_object(
+            'user_stats', (
+                SELECT json_build_object(
+                    'total_users', COUNT(*),
+                    'active_users', COUNT(*) FILTER (WHERE account_status = 'active'),
+                    'suspended_users', COUNT(*) FILTER (WHERE account_status = 'suspended'),
+                    'admin_users', COUNT(*) FILTER (WHERE role = 'admin')
+                ) FROM users
+            ),
+            'content_stats', (
+                SELECT json_build_object(
+                    'total_products', (SELECT COUNT(*) FROM products),
+                    'total_reviews', (SELECT COUNT(*) FROM reviews),
+                    'imported_reviews', (SELECT COUNT(*) FROM reviews WHERE source IN ('amazon', 'amazon_import', 'rainforest_amazon')),
+                    'analyzed_reviews', (SELECT COUNT(*) FROM reviews WHERE analysis_method IS NOT NULL),
+                    'total_imports', (SELECT COUNT(*) FROM amazon_imports),
+                    'pending_jobs', (SELECT COUNT(*) FROM analysis_jobs WHERE status = 'pending'),
+                    'failed_jobs', (SELECT COUNT(*) FROM analysis_jobs WHERE status = 'failed')
+                )
+            ),
+            'recent_users', (
+                SELECT COALESCE(json_agg(u), '[]'::json) FROM (
+                    SELECT id, name, email, role, account_status, created_at, last_login 
+                    FROM users ORDER BY created_at DESC LIMIT 5
+                ) u
+            ),
+            'recent_imports', (
+                SELECT COALESCE(json_agg(i), '[]'::json) FROM (
+                    SELECT id, asin, marketplace, product_title, imported_count, status, created_at 
+                    FROM amazon_imports ORDER BY created_at DESC LIMIT 5
+                ) i
+            ),
+            'recent_logs', (
+                SELECT COALESCE(json_agg(l), '[]'::json) FROM (
+                    SELECT id, admin_email, action, target_type, target_id, description, ip_address, created_at 
+                    FROM admin_activity_logs ORDER BY created_at DESC LIMIT 8
+                ) l
+            ),
+            'growth_data', (
+                SELECT COALESCE(json_agg(g), '[]'::json) FROM (
+                    SELECT DATE(created_at) as date, COUNT(*) as count 
+                    FROM users 
+                    WHERE created_at >= NOW() - INTERVAL '30 days'
+                    GROUP BY DATE(created_at) ORDER BY date ASC
+                ) g
+            ),
+            'categories', (
+                SELECT COALESCE(json_agg(c), '[]'::json) FROM (
+                    SELECT category, COUNT(*) as count 
+                    FROM products 
+                    WHERE category IS NOT NULL 
+                    GROUP BY category ORDER BY count DESC LIMIT 6
+                ) c
+            )
+        ) AS dashboard_data;
+        '''
 
-        # Recent registrations (last 5)
-        recent_users = execute_query('''
-            SELECT id, name, email, role, account_status, created_at, last_login 
-            FROM users 
-            ORDER BY created_at DESC 
-            LIMIT 5
-        ''', fetch_all=True) or []
+        row = execute_query(query, fetch_one=True)
+        raw_data = row.get('dashboard_data', {}) if row else {}
+        if isinstance(raw_data, str):
+            import json
+            raw_data = json.loads(raw_data)
 
-        # Recent imports (last 5)
-        recent_imports = execute_query('''
-            SELECT id, asin, marketplace, product_title, imported_count, status, created_at 
-            FROM amazon_imports 
-            ORDER BY created_at DESC 
-            LIMIT 5
-        ''', fetch_all=True) or []
-
-        # Recent activity logs (last 8)
-        recent_logs = execute_query('''
-            SELECT id, admin_email, action, target_type, target_id, description, ip_address, created_at 
-            FROM admin_activity_logs 
-            ORDER BY created_at DESC 
-            LIMIT 8
-        ''', fetch_all=True) or []
-
-        # User growth chart data (grouped by date)
-        growth_data = execute_query('''
-            SELECT 
-                DATE(created_at) as date, 
-                COUNT(*) as count 
-            FROM users 
-            WHERE created_at >= NOW() - INTERVAL '30 days'
-            GROUP BY DATE(created_at) 
-            ORDER BY date ASC
-        ''', fetch_all=True) or []
-
-        # Product categories distribution
-        categories = execute_query('''
-            SELECT category, COUNT(*) as count 
-            FROM products 
-            WHERE category IS NOT NULL 
-            GROUP BY category 
-            ORDER BY count DESC 
-            LIMIT 6
-        ''', fetch_all=True) or []
+        user_stats = raw_data.get('user_stats') or {}
+        content_stats = raw_data.get('content_stats') or {}
+        recent_users = raw_data.get('recent_users') or []
+        recent_imports = raw_data.get('recent_imports') or []
+        recent_logs = raw_data.get('recent_logs') or []
+        growth_data = raw_data.get('growth_data') or []
+        categories = raw_data.get('categories') or []
 
         # Format dates
         for item in recent_users:
@@ -121,37 +149,33 @@ def get_admin_dashboard():
             if item.get('date'):
                 item['date'] = str(item['date'])
 
-        return jsonify({
-            'success': True,
-            'data': {
-                'kpis': {
-                    'totalUsers': int(user_stats.get('total_users', 0)),
-                    'activeUsers': int(user_stats.get('active_users', 0)),
-                    'suspendedUsers': int(user_stats.get('suspended_users', 0)),
-                    'adminUsers': int(user_stats.get('admin_users', 0)),
-                    'totalProducts': int(content_stats.get('total_products', 0)),
-                    'totalReviews': int(content_stats.get('total_reviews', 0)),
-                    'importedReviews': int(content_stats.get('imported_reviews', 0)),
-                    'analyzedReviews': int(content_stats.get('analyzed_reviews', 0)),
-                    'totalImports': int(content_stats.get('total_imports', 0)),
-                    'pendingJobs': int(content_stats.get('pending_jobs', 0)),
-                    'failedJobs': int(content_stats.get('failed_jobs', 0))
-                },
-                'recentUsers': recent_users,
-                'recentImports': recent_imports,
-                'recentLogs': recent_logs,
-                'growthData': growth_data,
-                'categories': categories
-            }
-        }), 200
+        result = {
+            'kpis': {
+                'totalUsers': int(user_stats.get('total_users', 0)),
+                'activeUsers': int(user_stats.get('active_users', 0)),
+                'suspendedUsers': int(user_stats.get('suspended_users', 0)),
+                'adminUsers': int(user_stats.get('admin_users', 0)),
+                'totalProducts': int(content_stats.get('total_products', 0)),
+                'totalReviews': int(content_stats.get('total_reviews', 0)),
+                'importedReviews': int(content_stats.get('imported_reviews', 0)),
+                'analyzedReviews': int(content_stats.get('analyzed_reviews', 0)),
+                'totalImports': int(content_stats.get('total_imports', 0)),
+                'pendingJobs': int(content_stats.get('pending_jobs', 0)),
+                'failedJobs': int(content_stats.get('failed_jobs', 0))
+            },
+            'recentUsers': recent_users,
+            'recentImports': recent_imports,
+            'recentLogs': recent_logs,
+            'growthData': growth_data,
+            'categories': categories
+        }
+
+        set_cached_admin_dashboard(result)
+        return jsonify({'success': True, 'data': result}), 200
     except Exception as e:
         print(f"Admin Dashboard Error: {e}")
-        return jsonify({'success': False, 'message': 'Failed to load admin dashboard statistics.'}), 500
+        return jsonify({'success': False, 'message': f'Failed to fetch admin statistics: {str(e)}'}), 500
 
-
-# ============================================================
-# 2. USER MANAGEMENT
-# ============================================================
 @admin_bp.route('/users', methods=['GET'])
 def get_users():
     try:
@@ -246,7 +270,7 @@ def update_user_status(user_id):
         if not target_user:
             return jsonify({'success': False, 'message': 'User not found.'}), 404
 
-        updated = UserModel.update_status(user_id, new_status)
+        updated = UserModel.update_status(user_id, new_status); invalidate_user_cache(user_id); invalidate_admin_cache()
 
         action_name = 'USER_SUSPENDED' if new_status == 'suspended' else 'USER_ACTIVATED'
         log_activity(
@@ -283,7 +307,7 @@ def update_user_role(user_id):
         if not target_user:
             return jsonify({'success': False, 'message': 'User not found.'}), 404
 
-        updated = UserModel.update_role(user_id, new_role)
+        updated = UserModel.update_role(user_id, new_role); invalidate_user_cache(user_id); invalidate_admin_cache()
 
         log_activity(
             action='ROLE_CHANGED',
