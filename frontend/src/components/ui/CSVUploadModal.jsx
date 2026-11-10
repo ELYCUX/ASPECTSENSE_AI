@@ -15,29 +15,101 @@ export default function CSVUploadModal({ isOpen, onClose, onSuccess }) {
     const fileInputRef = useRef(null);
     const navigate = useNavigate();
 
+    const parseLine = (line) => {
+        if (!line || !line.trim()) return null;
+        const l = line.trim();
+        const delimiter = l.includes('|') ? '|' : (l.includes('\t') ? '\t' : ',');
+
+        let vals = [];
+        if (delimiter === ',') {
+            const match = l.match(/(?:^|,)(?:"([^"]*)"|([^,]*))/g);
+            if (match) {
+                vals = match.map(m => {
+                    let v = m.startsWith(',') ? m.substring(1) : m;
+                    return v.startsWith('"') ? v.slice(1, -1).trim() : v.trim();
+                });
+            } else {
+                vals = l.split(',').map(s => s.trim().replace(/^"|"$/g, ''));
+            }
+        } else {
+            vals = l.split(delimiter).map(s => s.trim().replace(/^"|"$/g, ''));
+        }
+
+        if (vals.length === 0) return null;
+
+        let product = 'General';
+        let rating = 5;
+        let text = '';
+        let author = 'Anonymous';
+
+        if (vals.length >= 3) {
+            const num1 = parseInt(vals[1]);
+            const num0 = parseInt(vals[0]);
+            if (!isNaN(num1) && num1 >= 1 && num1 <= 5) {
+                product = vals[0] || 'General';
+                rating = num1;
+                text = vals[2] || '';
+                author = vals[3] || 'Anonymous';
+            } else if (!isNaN(num0) && num0 >= 1 && num0 <= 5) {
+                rating = num0;
+                text = vals[1] || '';
+                author = vals[2] || 'Anonymous';
+                product = vals[3] || 'General';
+            } else {
+                product = vals[0] || 'General';
+                text = vals[1] || '';
+                author = vals[2] || 'Anonymous';
+            }
+        } else if (vals.length === 2) {
+            const num0 = parseInt(vals[0]);
+            if (!isNaN(num0) && num0 >= 1 && num0 <= 5) {
+                rating = num0;
+                text = vals[1] || '';
+            } else {
+                product = vals[0] || 'General';
+                text = vals[1] || '';
+            }
+        } else {
+            text = vals[0] || '';
+        }
+
+        // Ignore header lines
+        const lowerText = text.toLowerCase();
+        const lowerProd = String(product).toLowerCase();
+        if (lowerText === 'review_text' || lowerText === 'review' || lowerProd === 'product_name' || lowerProd === 'product') {
+            return null;
+        }
+
+        if (!text) return null;
+
+        return {
+            product_name: product,
+            rating,
+            review_text: text,
+            reviewer_name: author
+        };
+    };
+
     const handleFileChange = (e) => {
         const selected = e.target.files[0];
         if (selected) {
-            if (!selected.name.endsWith('.csv')) {
-                setError('Please select a valid CSV file.');
+            if (!selected.name.endsWith('.csv') && !selected.name.endsWith('.txt')) {
+                setError('Please select a valid CSV or TXT file.');
                 return;
             }
             setFile(selected);
             setError(null);
 
-            // very basic manual parsing for preview (using papaparse is better, falling back to simple split for MVP if not installed)
             const reader = new FileReader();
             reader.onload = (e) => {
                 const text = e.target.result;
-                const lines = text.split('\n').filter(l => l.trim().length > 0);
-                if (lines.length > 1) {
-                    const headers = lines[0].split(',').map(h => h.toLowerCase().trim());
-                    const previewRows = lines.slice(1, 4).map(l => {
-                        // super basic csv split taking quotes roughly into account
-                        const row = l.match(/(".*?"|[^",\s]+)(?=\s*,|\s*$)/g) || [];
-                        return row.map(v => v.replace(/^"|"$/g, ''));
+                const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+                if (lines.length > 0) {
+                    const delimiter = lines[0].includes('|') ? '|' : (lines[0].includes('\t') ? '\t' : ',');
+                    const previewRows = lines.slice(0, 4).map(l => {
+                        return l.split(delimiter).map(v => v.trim().replace(/^"|"$/g, ''));
                     });
-                    setPreview({ headers, rows: previewRows, count: lines.length - 1 });
+                    setPreview({ rows: previewRows, count: lines.length });
                 }
             };
             reader.readAsText(selected);
@@ -55,90 +127,40 @@ export default function CSVUploadModal({ isOpen, onClose, onSuccess }) {
                 if (!file) throw new Error("No file selected.");
                 const text = await file.text();
                 const rawLines = text.split('\n');
-                const headers = rawLines[0].split(',').map(h => h.toLowerCase().trim());
 
-                for (let i = 1; i < rawLines.length; i++) {
-                    let line = rawLines[i].trim();
-                    if (!line) continue;
-                    let match = line.match(/(?:^|,)(?:"([^"]*)"|([^,]*))/g);
-                    if (match) {
-                        const vals = match.map(m => {
-                            let v = m.startsWith(',') ? m.substring(1) : m;
-                            return v.startsWith('"') ? v.slice(1, -1) : v;
-                        });
-                        let obj = {};
-                        headers.forEach((h, idx) => { obj[h] = vals[idx] || ''; });
-                        rows.push({
-                            product_name: obj['product_name'] || obj['product'],
-                            rating: obj['rating'] || 5, // fallback rating
-                            review_text: obj['review_text'] || obj['review'],
-                            reviewer_name: obj['reviewer_name'] || obj['reviewer'] || 'Anonymous'
-                        });
-                    }
+                for (let i = 0; i < rawLines.length; i++) {
+                    const parsed = parseLine(rawLines[i]);
+                    if (parsed) rows.push(parsed);
                 }
             } else {
                 if (!pasteText.trim()) throw new Error("Please paste some text to analyze.");
-
-                const lines = pasteText.split('\n').filter(l => l.trim().length > 0);
+                const lines = pasteText.split('\n');
                 for (let line of lines) {
-                    // Quick check if pipe delimited or CSV
-                    const delimiter = line.includes('|') ? '|' : ',';
-
-                    // Simple CSV split matching respecting quotes
-                    let match = line.match(/(?:^|,|\|)(?:"([^"]*)"|([^,|]*))/g);
-                    if (match && delimiter === ',') {
-                        // Standard CSV format matching (Product, Rating, Review, Name)
-                        const vals = match.map(m => {
-                            let v = m.replace(/^[,|]/, '');
-                            return v.startsWith('"') ? v.slice(1, -1) : v;
-                        });
-
-                        if (vals.length >= 3) {
-                            rows.push({
-                                product_name: vals[0] || 'General',
-                                rating: parseInt(vals[1]) || 5,
-                                review_text: vals[2] || '',
-                                reviewer_name: vals[3] || 'Anonymous'
-                            });
-                        }
-                    } else if (line.includes('|')) {
-                        const parts = line.split('|').map(s => s.trim());
-                        if (parts.length >= 3) {
-                            rows.push({
-                                product_name: parts[0],
-                                rating: parseInt(parts[1]) || 5,
-                                review_text: parts[2],
-                                reviewer_name: parts[3] || 'Anonymous'
-                            });
-                        }
-                    } else {
-                        // Fallback
-                        rows.push({
-                            product_name: "General",
-                            rating: 5,
-                            review_text: line,
-                            reviewer_name: "Anonymous"
-                        });
-                    }
+                    const parsed = parseLine(line);
+                    if (parsed) rows.push(parsed);
                 }
             }
 
-            if (rows.length === 0) throw new Error("No valid review rows found.");
+            if (rows.length === 0) {
+                throw new Error("No valid review rows found. Please check your data format.");
+            }
 
+            // Post to backend bulk review import route
             const res = await api.post('/reviews/bulk', { reviews: rows });
 
-            // Redirect immediately to dashboard passing the batch state
             if (onSuccess) onSuccess();
-            navigate('/dashboard', {
-                state: {
-                    batchStats: res.data.data.batchStats,
-                    batchReviews: res.data.data.batchReviews
-                }
-            });
+            if (res.data?.data?.batchStats) {
+                navigate('/dashboard', {
+                    state: {
+                        batchStats: res.data.data.batchStats,
+                        batchReviews: res.data.data.batchReviews || []
+                    }
+                });
+            }
             onClose();
 
         } catch (err) {
-            setError(err.response?.data?.message || err.message || 'Failed to import reviews. ');
+            setError(err.response?.data?.message || err.message || 'Failed to import reviews.');
         } finally {
             setLoading(false);
         }
@@ -169,7 +191,7 @@ export default function CSVUploadModal({ isOpen, onClose, onSuccess }) {
                                 </div>
                             ) : (
                                 <div className="space-y-4">
-                                    {error && <div className="bg-red-500/10 border border-red-500/20 text-red-500 text-sm p-3 rounded-lg flex items-center gap-2"><AlertCircle className="w-4 h-4" />{error}</div>}
+                                    {error && <div className="bg-red-500/10 border border-red-500/20 text-red-500 text-sm p-3 rounded-lg flex items-center gap-2"><AlertCircle className="w-4 h-4 shrink-0" />{error}</div>}
 
                                     <div className="flex border-b border-white/10 mb-4">
                                         <button
@@ -190,9 +212,9 @@ export default function CSVUploadModal({ isOpen, onClose, onSuccess }) {
                                                 onClick={() => fileInputRef.current?.click()}
                                                 className="border-2 border-dashed border-white/20 rounded-xl p-8 flex flex-col items-center justify-center cursor-pointer hover:border-primary-500/50 hover:bg-primary-500/5 transition group">
                                                 <UploadCloud className="w-10 h-10 text-gray-500 group-hover:text-primary-400 mb-3" />
-                                                <p className="text-sm font-medium text-gray-300">Click to upload CSV</p>
-                                                <p className="text-xs text-gray-500 mt-1">Requires columns: product_name, rating, review_text</p>
-                                                <input type="file" accept=".csv" className="hidden" ref={fileInputRef} onChange={handleFileChange} />
+                                                <p className="text-sm font-medium text-gray-300">Click to upload CSV or TXT file</p>
+                                                <p className="text-xs text-gray-500 mt-1">Columns: Product Name | Rating (1-5) | Review Text | Reviewer Name</p>
+                                                <input type="file" accept=".csv,.txt" className="hidden" ref={fileInputRef} onChange={handleFileChange} />
                                             </div>
                                         ) : (
                                             <div className="space-y-4">
@@ -226,7 +248,7 @@ export default function CSVUploadModal({ isOpen, onClose, onSuccess }) {
 
                                                 <button onClick={handleUpload} disabled={loading}
                                                     className="w-full flex items-center justify-center gap-2 bg-primary-600 hover:bg-primary-500 text-white p-2.5 rounded-lg text-sm font-medium transition disabled:opacity-50">
-                                                    {loading ? <><Loader2 className="w-4 h-4 animate-spin" /> Importing...</> : 'Confirm Import & Analyze'}
+                                                    {loading ? <><Loader2 className="w-4 h-4 animate-spin" /> Importing & Analyzing...</> : 'Confirm Import & Analyze'}
                                                 </button>
                                             </div>
                                         )

@@ -217,6 +217,7 @@ def check_duplicate_route():
         print('Check Duplicate Error:', e)
         return jsonify({'success': False, 'message': 'Failed to check duplicate.'}), 500
 
+@review_bp.route('/bulk', methods=['POST'])
 @review_bp.route('/bulk-json', methods=['POST'])
 @token_required
 def upload_bulk_reviews():
@@ -246,26 +247,52 @@ def upload_bulk_reviews():
             prod_name = r.get('product_name') or r.get('productName')
             prod_id = r.get('product_id') or r.get('productId')
             
+            # Check if prod_name is actually an existing product numeric ID (e.g. 12 or "12")
             if not prod_id and prod_name:
-                 loose_name = prod_name.lower().strip()
+                try:
+                    cand_id = int(str(prod_name).strip())
+                    if cand_id in product_id_to_name:
+                        prod_id = cand_id
+                except (ValueError, TypeError):
+                    pass
+            
+            if not prod_id and prod_name:
+                 loose_name = str(prod_name).lower().strip()
                  if loose_name in product_map:
                      prod_id = product_map[loose_name]
                  else:
                      new_p = execute_query(
                          'INSERT INTO products (name, category, brand, user_id, is_shared) VALUES ($1, $2, $3, $4, FALSE) RETURNING id',
-                         [prod_name, r.get('category', 'General'), r.get('brand', 'Generic'), user_id],
+                         [str(prod_name), r.get('category', 'General'), r.get('brand', 'Generic'), user_id],
                          fetch_one=True
                      )
                      if new_p:
                          prod_id = new_p['id']
                          product_map[loose_name] = prod_id
-                         product_id_to_name[prod_id] = prod_name
+                         product_id_to_name[prod_id] = str(prod_name)
                   
-            if not prod_id: continue
+            if not prod_id:
+                if existing_products:
+                    prod_id = existing_products[0]['id']
+                else:
+                    new_p = execute_query(
+                        'INSERT INTO products (name, category, brand, user_id, is_shared) VALUES ($1, $2, $3, $4, FALSE) RETURNING id',
+                        ['General Product', 'General', 'Generic', user_id],
+                        fetch_one=True
+                    )
+                    prod_id = new_p['id'] if new_p else 1
+                    product_id_to_name[prod_id] = 'General Product'
             
-            rating = int(r.get('rating', 3))
-            body = r.get('review_text') or r.get('reviewText')
-            user_name = r.get('reviewer_name') or r.get('reviewerName', 'Anonymous')
+            try:
+                rating = int(float(r.get('rating', 3)))
+                rating = max(1, min(5, rating))
+            except (ValueError, TypeError):
+                rating = 3
+
+            body = r.get('review_text') or r.get('reviewText') or r.get('body') or r.get('review') or r.get('text')
+            user_name = r.get('reviewer_name') or r.get('reviewerName') or r.get('user_name') or r.get('author') or 'Anonymous'
+            if not body or not str(body).strip():
+                continue
             
             analysis_findings, aspects_json, new_sentiment = _analyze(body, rating)
                 
@@ -342,12 +369,25 @@ def upload_bulk_reviews():
             'recentReviews': batch_reviews_response[:10]
         }
         
+        # Invalidate dashboard caches so new reviews appear immediately
+        try:
+            from routes.dashboard_routes import invalidate_dashboard_cache
+            invalidate_dashboard_cache()
+        except Exception:
+            pass
+        try:
+            from routes.admin_routes import invalidate_admin_cache
+            invalidate_admin_cache()
+        except Exception:
+            pass
+
         return jsonify({
             'success': True,
             'message': f'Successfully uploaded and analyzed {created_count} reviews',
             'data': {
                 'count': created_count,
-                'batchStats': batch_stats
+                'batchStats': batch_stats,
+                'batchReviews': batch_reviews_response
             }
         }), 201
     except Exception as e:
