@@ -21,22 +21,22 @@ export default function RatingDistributionChart({ data = [] }) {
     labels: chartData.map(d => d.rating),
     datasets: [{
       data: chartData.map(d => d.count),
-      backgroundColor: ['#dbeafe', '#bfdbfe', '#93c5fd', '#60a5fa', '#3b82f6'],
-      borderColor: ['#ffffff'],
-      borderWidth: 3,
-      hoverOffset: 8,
+      backgroundColor: ['#3b82f6', '#60a5fa', '#93c5fd', '#a78bfa', '#818cf8'],
+      borderColor: ['#0f172a'],
+      borderWidth: 2,
+      hoverOffset: 6,
     }],
   };
 
   const options = {
     responsive: true,
     maintainAspectRatio: false,
-    cutout: '70%',
+    cutout: '72%',
     plugins: {
       legend: {
         position: 'bottom',
         labels: {
-          color: '#6b7280',
+          color: '#94a3b8',
           font: { size: 11, family: 'Inter' },
           padding: 12,
           usePointStyle: true,
@@ -44,28 +44,30 @@ export default function RatingDistributionChart({ data = [] }) {
         },
       },
       tooltip: {
-        backgroundColor: '#ffffff',
-        borderColor: '#e5e7eb',
+        backgroundColor: '#1e293b',
+        borderColor: 'rgba(255,255,255,0.1)',
         borderWidth: 1,
-        titleColor: '#111827',
-        bodyColor: '#4b5563',
-        padding: 12,
+        titleColor: '#ffffff',
+        bodyColor: '#cbd5e1',
+        padding: 10,
         callbacks: {
-          label: (ctx) => ` ${ctx.label}: ${ctx.parsed.toLocaleString()} (${((ctx.parsed / total) * 100).toFixed(1)}%)`,
+          label: (ctx) => ` ${ctx.label}: ${ctx.parsed.toLocaleString()} (${total ? ((ctx.parsed / total) * 100).toFixed(1) : 0}%)`,
         },
       },
     },
   };
 
   return (
-    <div className="bg-white rounded-xl p-6 border border-gray-200 shadow-sm flex flex-col">
-      <h3 className="text-base font-semibold text-gray-900 mb-1">Rating Distribution</h3>
-      <p className="text-xs text-gray-500 mb-5">Breakdown of all star ratings</p>
+    <div className="card p-6 flex flex-col justify-between h-full">
+      <div>
+        <h3 className="text-base font-semibold text-white mb-1">Rating Distribution</h3>
+        <p className="text-xs text-gray-400 mb-4">Breakdown of all star ratings</p>
+      </div>
       <div className="relative h-52">
         <Doughnut data={config} options={options} />
-        <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none">
-          <p className="text-2xl font-bold text-gray-900">{total.toLocaleString()}</p>
-          <p className="text-xs text-gray-500">Total</p>
+        <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none pb-6">
+          <p className="text-2xl font-bold text-white tracking-tight">{total.toLocaleString()}</p>
+          <p className="text-[11px] text-gray-400 font-medium">Total Reviews</p>
         </div>
       </div>
     </div>

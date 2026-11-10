@@ -51,15 +51,17 @@ def get_stats():
             return jsonify({'success': True, 'data': cached, 'cached': True}), 200
 
     try:
-        # Build role-aware user filter clause
+        # Build role-aware user filter clause with explicit table qualification
         if is_admin:
             user_rev_filter = "1=1"
             user_prod_filter = "1=1"
+            top_prod_filter = "1=1"
             params = []
         else:
             # For normal users: access their own records or shared system records
             user_rev_filter = "(user_id = $1 OR is_shared = TRUE OR user_id IS NULL)"
             user_prod_filter = "(user_id = $1 OR is_shared = TRUE OR user_id IS NULL)"
+            top_prod_filter = "(p.user_id = $1 OR p.is_shared = TRUE OR p.user_id IS NULL)"
             params = [user_id]
 
         query = f"""
@@ -103,7 +105,7 @@ def get_stats():
                            COUNT(r.id) FILTER (WHERE r.sentiment = 'positive')::int as positive_count
                     FROM products p
                     LEFT JOIN reviews r ON r.product_id = p.id
-                    WHERE {user_prod_filter}
+                    WHERE {top_prod_filter}
                     GROUP BY p.id, p.name, p.brand, p.avg_rating, p.review_count
                     ORDER BY p.avg_rating DESC NULLS LAST, p.review_count DESC
                     LIMIT 5

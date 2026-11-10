@@ -73,12 +73,17 @@ export default function DashboardPage() {
     if (isRefresh) setRefreshing(true);
     else setLoading(true);
     try {
-      const [statsRes, reviewRes] = await Promise.all([
-        api.get('/dashboard/stats'),
-        api.get('/reviews?limit=6'),
-      ]);
-      setStats(statsRes.data.data);
-      setReviews(reviewRes.data.data.reviews);
+      const statsPromise = api.get(`/dashboard/stats${isRefresh ? '?refresh=true' : ''}`);
+      const reviewPromise = api.get('/reviews?limit=6');
+
+      const [statsRes, reviewRes] = await Promise.allSettled([statsPromise, reviewPromise]);
+
+      if (statsRes.status === 'fulfilled' && statsRes.value?.data?.data) {
+        setStats(statsRes.value.data.data);
+      }
+      if (reviewRes.status === 'fulfilled' && reviewRes.value?.data?.data?.reviews) {
+        setReviews(reviewRes.value.data.data.reviews);
+      }
     } catch (err) {
       addToast('Failed to load dashboard data.', 'error');
     } finally {
@@ -273,6 +278,15 @@ export default function DashboardPage() {
                   </div>
                   {loading ? (
                     <div className="p-5 space-y-3">{Array(5).fill(0).map((_, i) => <SkeletonRow key={i} />)}</div>
+                  ) : reviews.length === 0 ? (
+                    <div className="p-8 text-center text-gray-400 my-auto">
+                      <MessageSquare className="w-8 h-8 text-gray-600 mx-auto mb-2 opacity-60" />
+                      <p className="text-sm font-medium text-gray-300">No reviews recorded yet</p>
+                      <p className="text-xs text-gray-500 mt-1">Import reviews from Amazon or upload a CSV to get started.</p>
+                      <Link to="/reviews" className="inline-flex items-center gap-1.5 mt-3 text-xs text-primary-400 hover:text-primary-300 font-semibold">
+                        Go to Reviews &rarr;
+                      </Link>
+                    </div>
                   ) : (
                     <div className="overflow-x-auto flex-1">
                       <table className="w-full text-left text-sm whitespace-nowrap min-w-[600px]">
@@ -361,22 +375,29 @@ export default function DashboardPage() {
                 <div className="card p-5">
                   <h3 className="text-base font-semibold text-white mb-4">Quick Actions</h3>
                   <div className="grid grid-cols-2 gap-3">
-                    <button className="flex flex-col items-center justify-center p-3 rounded-xl border border-white/5 bg-white/5 hover:bg-white/10 transition-colors text-gray-300 shadow-sm">
-                      <Plus className="w-4 h-4 mb-2 text-gray-400" />
-                      <span className="text-[11px] font-medium">Add Product</span>
+                    <Link to="/reviews" className="flex flex-col items-center justify-center p-3 rounded-xl border border-white/5 bg-white/5 hover:bg-white/10 transition-colors text-gray-300 shadow-sm">
+                      <Plus className="w-4 h-4 mb-2 text-primary-400" />
+                      <span className="text-[11px] font-medium">Add Review</span>
+                    </Link>
+                    <Link to="/amazon-import" className="flex flex-col items-center justify-center p-3 rounded-xl border border-white/5 bg-white/5 hover:bg-white/10 transition-colors text-gray-300 shadow-sm">
+                      <Zap className="w-4 h-4 mb-2 text-amber-400" />
+                      <span className="text-[11px] font-medium">Amazon Import</span>
+                    </Link>
+                    <button onClick={handleExportCSV} disabled={exporting} className="flex flex-col items-center justify-center p-3 rounded-xl border border-white/5 bg-white/5 hover:bg-white/10 transition-colors text-gray-300 shadow-sm disabled:opacity-50">
+                      <FileText className="w-4 h-4 mb-2 text-emerald-400" />
+                      <span className="text-[11px] font-medium">Export CSV</span>
                     </button>
-                    <button className="flex flex-col items-center justify-center p-3 rounded-xl border border-white/5 bg-white/5 hover:bg-white/10 transition-colors text-gray-300 shadow-sm">
-                      <Upload className="w-4 h-4 mb-2 text-gray-400" />
-                      <span className="text-[11px] font-medium">Import CSV</span>
-                    </button>
-                    <button className="flex flex-col items-center justify-center p-3 rounded-xl border border-white/5 bg-white/5 hover:bg-white/10 transition-colors text-gray-300 shadow-sm">
-                      <FileText className="w-4 h-4 mb-2 text-gray-400" />
-                      <span className="text-[11px] font-medium">Generate Report</span>
-                    </button>
-                    <button className="flex flex-col items-center justify-center p-3 rounded-xl border border-white/5 bg-white/5 hover:bg-white/10 transition-colors text-gray-300 shadow-sm">
-                      <Users className="w-4 h-4 mb-2 text-gray-400" />
-                      <span className="text-[11px] font-medium">Manage Users</span>
-                    </button>
+                    {user?.role === 'admin' ? (
+                      <Link to="/admin/users" className="flex flex-col items-center justify-center p-3 rounded-xl border border-white/5 bg-white/5 hover:bg-white/10 transition-colors text-gray-300 shadow-sm">
+                        <Users className="w-4 h-4 mb-2 text-indigo-400" />
+                        <span className="text-[11px] font-medium">Manage Users</span>
+                      </Link>
+                    ) : (
+                      <Link to="/compare" className="flex flex-col items-center justify-center p-3 rounded-xl border border-white/5 bg-white/5 hover:bg-white/10 transition-colors text-gray-300 shadow-sm">
+                        <Activity className="w-4 h-4 mb-2 text-sky-400" />
+                        <span className="text-[11px] font-medium">Compare</span>
+                      </Link>
+                    )}
                   </div>
                 </div>
 
