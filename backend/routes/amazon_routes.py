@@ -123,7 +123,7 @@ def fetch_preview():
         return jsonify({'success': False, 'message': str(e), 'code': 'CONNECTION_ERROR'}), 503
     except Exception as e:
         logger.error(f"Amazon fetch error: {e}", exc_info=True)
-        return jsonify({'success': False, 'message': 'Failed to fetch Amazon product data.'}), 500
+        return jsonify({'success': False, 'message': f'Failed to fetch Amazon product data: {str(e)}'}), 500
 
 
 @amazon_bp.route('/import', methods=['POST'])

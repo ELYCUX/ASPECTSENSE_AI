@@ -114,7 +114,16 @@ def _make_request(params: dict, timeout: int = 30) -> dict:
     try:
         response = requests.get(RAINFOREST_BASE_URL, params=params, timeout=timeout)
 
-        if response.status_code == 401:
+        if response.status_code == 400:
+            try:
+                err_msg = response.json().get("request_info", {}).get("message")
+                if err_msg:
+                    raise ValueError(f"Rainforest API: {err_msg}")
+            except Exception as parse_err:
+                if isinstance(parse_err, ValueError):
+                    raise parse_err
+            raise ValueError(f"Bad request to Rainforest API: {response.text[:200]}")
+        elif response.status_code == 401:
             raise PermissionError("Invalid Rainforest API key.")
         elif response.status_code == 402:
             raise PermissionError("Rainforest API credits exhausted. Please top up your account.")
@@ -136,7 +145,7 @@ def _make_request(params: dict, timeout: int = 30) -> dict:
 
 def fetch_product_details(amazon_url: str) -> dict:
     """
-    Fetch product details from Rainforest API using the product URL.
+    Fetch product details from Rainforest API using ASIN + domain or URL.
 
     Args:
         amazon_url: Full Amazon product URL
@@ -144,12 +153,22 @@ def fetch_product_details(amazon_url: str) -> dict:
     Returns:
         dict with product details or raises exception
     """
-    params = {
-        "type": "product",
-        "url": amazon_url,
-        "include_summarization_attributes": False,
-        "include_a_plus_body": False,
-    }
+    asin = extract_asin(amazon_url)
+    domain_info = validate_amazon_url(amazon_url)
+    domain = domain_info.get("domain")
+
+    # Prefer ASIN + amazon_domain (cleaner, faster, avoids complex tracking params)
+    if asin and domain:
+        params = {
+            "type": "product",
+            "asin": asin,
+            "amazon_domain": domain,
+        }
+    else:
+        params = {
+            "type": "product",
+            "url": amazon_url,
+        }
 
     data = _make_request(params)
     product = data.get("product", {})
@@ -185,11 +204,23 @@ def fetch_product_reviews(amazon_url: str, page: int = 1) -> dict:
     Returns:
         dict with reviews list and metadata
     """
-    params = {
-        "type": "reviews",
-        "url": amazon_url,
-        "page": page,
-    }
+    asin = extract_asin(amazon_url)
+    domain_info = validate_amazon_url(amazon_url)
+    domain = domain_info.get("domain")
+
+    if asin and domain:
+        params = {
+            "type": "reviews",
+            "asin": asin,
+            "amazon_domain": domain,
+            "page": page,
+        }
+    else:
+        params = {
+            "type": "reviews",
+            "url": amazon_url,
+            "page": page,
+        }
 
     try:
         data = _make_request(params)
