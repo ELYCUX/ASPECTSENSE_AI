@@ -32,7 +32,7 @@ export default function AdminDashboardPage() {
   }, []);
 
   const kpis = data?.kpis || {};
-  const isInitialLoading = loading && !data;
+  const isInitialLoading = loading || !data;
 
   return (
     <AdminLayout

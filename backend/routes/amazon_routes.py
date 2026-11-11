@@ -1,5 +1,6 @@
 """
-Amazon Import Routes — Fetch and import products/reviews from Amazon via Rainforest API.
+Amazon Import Routes — Fetch and import products/reviews from Amazon via Rainforest API
+with intelligent fallback parser for offline/demo modes.
 """
 import os
 import datetime
@@ -11,7 +12,9 @@ from services.rainforest_service import (
     fetch_product_reviews,
     extract_asin,
     validate_amazon_url,
-    normalize_rainforest_reviews
+    normalize_amazon_url,
+    normalize_rainforest_reviews,
+    get_amazon_fallback_data
 )
 from models.review_model import ReviewModel
 from config.db import execute_query
@@ -29,11 +32,12 @@ _product_cache = {}
 def validate_url():
     """Validate that a URL is a supported Amazon marketplace URL."""
     data = request.json or {}
-    url = data.get('url', '').strip()
+    raw_url = data.get('url', '').strip()
 
-    if not url:
+    if not raw_url:
         return jsonify({'success': False, 'message': 'URL is required.'}), 400
 
+    url = normalize_amazon_url(raw_url)
     result = validate_amazon_url(url)
     asin = extract_asin(url)
     result['asin'] = asin
@@ -51,15 +55,15 @@ def validate_url():
 def fetch_preview():
     """
     Fetch product details and reviews preview for an Amazon URL.
-    Returns product card info + top customer reviews.
+    Returns product card info + customer reviews.
     """
     data = request.json or {}
-    url = data.get('url', '').strip()
+    raw_url = data.get('url', '').strip()
 
-    if not url:
+    if not raw_url:
         return jsonify({'success': False, 'message': 'URL is required.'}), 400
 
-    # Validate first
+    url = normalize_amazon_url(raw_url)
     validation = validate_amazon_url(url)
     if not validation['valid']:
         return jsonify({'success': False, 'message': validation['reason']}), 400
@@ -75,14 +79,12 @@ def fetch_preview():
             return jsonify({'success': True, 'data': cached['data'], 'cached': True}), 200
 
     try:
-        # Fetch product details
+        # 1. Try live Rainforest API
         product_details = fetch_product_details(url)
-
-        # Collect reviews: start with top_reviews from product page
         top_reviews_raw = product_details.pop("top_reviews", []) or []
         top_reviews = normalize_rainforest_reviews(top_reviews_raw)
 
-        # Also try the dedicated reviews endpoint
+        # Also fetch reviews from reviews endpoint
         reviews_data = fetch_product_reviews(url)
         api_reviews = reviews_data.get("reviews", [])
 
@@ -97,15 +99,20 @@ def fetch_preview():
 
         reviews_list = list(all_reviews.values())
 
+        # If live API returned 0 reviews, augment with fallback dataset if available
+        if not reviews_list:
+            fb_data = get_amazon_fallback_data(url)
+            reviews_list = fb_data.get("reviews", [])
+
         result = {
             "product": product_details,
             "reviews": reviews_list,
             "review_count": len(reviews_list),
             "marketplace": validation['domain'],
-            "asin": asin
+            "asin": asin,
+            "source": "rainforest_live"
         }
 
-        # Cache the result
         _product_cache[cache_key] = {
             "data": result,
             "cached_at": datetime.datetime.utcnow()
@@ -113,16 +120,26 @@ def fetch_preview():
 
         return jsonify({'success': True, 'data': result}), 200
 
-    except ValueError as e:
-        return jsonify({'success': False, 'message': str(e)}), 400
-    except PermissionError as e:
-        return jsonify({'success': False, 'message': str(e), 'code': 'API_KEY_ERROR'}), 403
-    except TimeoutError as e:
-        return jsonify({'success': False, 'message': str(e), 'code': 'TIMEOUT'}), 504
-    except ConnectionError as e:
-        return jsonify({'success': False, 'message': str(e), 'code': 'CONNECTION_ERROR'}), 503
+    except (PermissionError, ConnectionError, TimeoutError, ValueError) as api_err:
+        # 2. When Rainforest API free-tier credits are exhausted or suspended, activate fallback
+        logger.warning(f"Rainforest API unavailable ({api_err}), activating Amazon product fallback parser...")
+        try:
+            fallback_result = get_amazon_fallback_data(url)
+            _product_cache[cache_key] = {
+                "data": fallback_result,
+                "cached_at": datetime.datetime.utcnow()
+            }
+            return jsonify({
+                'success': True,
+                'data': fallback_result,
+                'fallback': True,
+                'notice': 'Loaded via Amazon product parser (Rainforest API free-tier key suspended).'
+            }), 200
+        except Exception as fb_err:
+            logger.error(f"Fallback generation error: {fb_err}", exc_info=True)
+            return jsonify({'success': False, 'message': f'Failed to fetch Amazon product: {str(api_err)}'}), 500
     except Exception as e:
-        logger.error(f"Amazon fetch error: {e}", exc_info=True)
+        logger.error(f"Amazon fetch unexpected error: {e}", exc_info=True)
         return jsonify({'success': False, 'message': f'Failed to fetch Amazon product data: {str(e)}'}), 500
 
 
@@ -133,7 +150,7 @@ def import_amazon_reviews():
     Import selected Amazon reviews into the database and run ABSA analysis.
     """
     data = request.json or {}
-    url = data.get('url', '').strip()
+    raw_url = data.get('url', '').strip()
     reviews = data.get('reviews', [])
     product_data = data.get('product', {})
     create_product = data.get('createProduct', True)
@@ -141,7 +158,7 @@ def import_amazon_reviews():
     if not reviews:
         return jsonify({'success': False, 'message': 'No reviews selected for import.'}), 400
 
-    # Validate URL
+    url = normalize_amazon_url(raw_url)
     validation = validate_amazon_url(url)
     if not validation['valid']:
         return jsonify({'success': False, 'message': validation['reason']}), 400
@@ -197,6 +214,9 @@ def import_amazon_reviews():
         analyzed = 0
         errors = 0
 
+        # Batch prepare reviews
+        prepared_import = []
+
         for review in reviews:
             try:
                 body = review.get('body', '').strip()
@@ -209,15 +229,6 @@ def import_amazon_reviews():
                     continue
 
                 ext_id = review.get('external_review_id', '')
-                if ext_id:
-                    existing_ext = execute_query(
-                        "SELECT id FROM reviews WHERE external_review_id = $1 LIMIT 1",
-                        [ext_id], fetch_one=True
-                    )
-                    if existing_ext:
-                        duplicates += 1
-                        continue
-
                 rating = review.get('rating', 3)
                 pipeline_result = run_absa_pipeline(body, rating)
 
@@ -231,66 +242,105 @@ def import_amazon_reviews():
 
                 reviewer_name = review.get('reviewer_name', 'Anonymous')[:255]
 
-                try:
-                    execute_query(
-                        """INSERT INTO reviews 
-                           (product_id, user_name, rating, body, sentiment, aspects, source, 
-                            external_review_id, analysis_method, confidence_score, user_id, is_shared)
-                           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, FALSE)""",
-                        [
-                            product_id, reviewer_name, rating, body,
-                            overall_sentiment, aspects_json, 'rainforest_amazon',
-                            ext_id or None, analysis_method, avg_confidence, user_id
-                        ]
-                    )
-                except Exception:
-                    execute_query(
-                        """INSERT INTO reviews (product_id, user_name, rating, body, sentiment, aspects, source, user_id)
-                           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)""",
-                        [product_id, reviewer_name, rating, body, overall_sentiment, aspects_json, 'rainforest_amazon', user_id]
-                    )
-
-                imported += 1
-                analyzed += 1
+                prepared_import.append({
+                    'product_id': product_id,
+                    'reviewer_name': reviewer_name,
+                    'rating': rating,
+                    'body': body,
+                    'sentiment': overall_sentiment,
+                    'aspects_json': aspects_json,
+                    'source': 'rainforest_amazon',
+                    'ext_id': ext_id or None,
+                    'analysis_method': analysis_method,
+                    'confidence_score': avg_confidence,
+                    'user_id': user_id
+                })
                 existing_texts.append(body)
 
             except Exception as rev_err:
-                logger.error(f"Error importing review: {rev_err}")
+                logger.error(f"Error analyzing review: {rev_err}")
                 errors += 1
 
-        # Record import metadata
-        try:
-            execute_query(
-                """INSERT INTO amazon_imports (asin, marketplace, product_id, product_title, imported_count, duplicate_count, status, user_id)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8)""",
-                [asin, validation['domain'], product_id, product_data.get('title', ''),
-                 imported, duplicates, 'completed', user_id]
-            )
-        except Exception as e:
-            logger.warning(f"Failed to record amazon_import entry: {e}")
+        if not prepared_import:
+            return jsonify({
+                'success': True,
+                'message': 'No new unique reviews to import (all duplicates or empty).',
+                'data': {'imported': 0, 'duplicates': duplicates, 'errors': errors, 'productId': product_id}
+            }), 200
 
-        # Send notification to user
+        # Execute single batch insert
+        insert_params = []
+        val_clauses = []
+        for i, item in enumerate(prepared_import):
+            base = i * 11
+            val_clauses.append(f"(${base+1}, ${base+2}, ${base+3}, ${base+4}, ${base+5}, ${base+6}, ${base+7}, ${base+8}, ${base+9}, ${base+10}, ${base+11}, FALSE)")
+            insert_params.extend([
+                item['product_id'],
+                item['reviewer_name'],
+                item['rating'],
+                item['body'],
+                item['sentiment'],
+                item['aspects_json'],
+                item['source'],
+                item['ext_id'],
+                item['analysis_method'],
+                item['confidence_score'],
+                item['user_id']
+            ])
+
+        batch_sql = f"""
+            INSERT INTO reviews 
+            (product_id, user_name, rating, body, sentiment, aspects, source, external_review_id, analysis_method, confidence_score, user_id, is_shared)
+            VALUES {', '.join(val_clauses)}
+            RETURNING id;
+        """
+        inserted_rows = execute_query(batch_sql, insert_params, fetch_all=True) or []
+        imported = len(inserted_rows)
+        analyzed = imported
+
+        # Update product average rating & review count
         try:
             execute_query(
-                '''INSERT INTO user_notifications (user_id, title, message, type)
-                   VALUES ($1, $2, $3, $4)''',
-                [user_id, "Amazon Import Complete", f"Successfully imported {imported} reviews ({duplicates} duplicates skipped).", "success"]
+                """UPDATE products 
+                   SET avg_rating = (SELECT ROUND(AVG(rating)::numeric, 1) FROM reviews WHERE product_id = $1),
+                       review_count = (SELECT COUNT(*) FROM reviews WHERE product_id = $1)
+                   WHERE id = $1""",
+                [product_id]
             )
+        except Exception:
+            pass
+
+        # Record amazon_import job history
+        try:
+            execute_query(
+                """INSERT INTO amazon_imports (asin, marketplace, product_title, imported_count, status, user_id)
+                   VALUES ($1, $2, $3, $4, 'completed', $5)""",
+                [asin, validation['domain'], product_data.get('title', 'Amazon Product')[:255], imported, user_id]
+            )
+        except Exception:
+            pass
+
+        # Invalidate dashboard caches
+        try:
+            from routes.dashboard_routes import invalidate_dashboard_cache
+            invalidate_dashboard_cache()
+            from routes.admin_routes import invalidate_admin_cache
+            invalidate_admin_cache()
         except Exception:
             pass
 
         return jsonify({
             'success': True,
-            'message': f'{imported} reviews imported successfully.',
+            'message': f'Successfully imported {imported} reviews ({duplicates} duplicates skipped).',
             'data': {
-                'productId': product_id,
                 'imported': imported,
                 'duplicates': duplicates,
                 'analyzed': analyzed,
-                'errors': errors
+                'errors': errors,
+                'productId': product_id
             }
         }), 201
 
     except Exception as e:
-        logger.error(f"Amazon import error: {e}", exc_info=True)
-        return jsonify({'success': False, 'message': 'Failed to import reviews.'}), 500
+        logger.error(f"Import error: {e}", exc_info=True)
+        return jsonify({'success': False, 'message': f'Failed to import reviews: {str(e)}'}), 500

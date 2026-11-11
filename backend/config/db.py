@@ -43,7 +43,8 @@ def _create_raw_connection():
             host=host,
             port=port,
             database=database,
-            ssl_context=ssl_context
+            ssl_context=ssl_context,
+            timeout=15
         )
     else:
         host = os.environ.get('DB_HOST', 'localhost')
@@ -57,37 +58,52 @@ def _create_raw_connection():
             password=password,
             host=host,
             port=port,
-            database=database
+            database=database,
+            timeout=15
         )
 
 
 def _get_pooled_connection():
-    """Acquire a connection from the pool or create a new one."""
+    """Acquire a connection from the pool or create a new one without lock contention."""
     global _created_connections
     conn = None
     
-    # Try getting an existing idle connection from pool
+    # 1. Try getting an existing idle connection from pool instantly
     try:
         conn = _connection_pool.get_nowait()
+        return conn, True
     except queue.Empty:
-        with _pool_lock:
-            if _created_connections < POOL_SIZE:
-                _created_connections += 1
-                try:
-                    conn = _create_raw_connection()
-                except Exception as e:
-                    _created_connections -= 1
-                    raise e
-    
-    # If pool was full and none were immediately available, wait up to 5s
-    if conn is None:
+        pass
+
+    # 2. Check if we can create a new connection under lock
+    should_create = False
+    with _pool_lock:
+        if _created_connections < POOL_SIZE:
+            _created_connections += 1
+            should_create = True
+
+    # 3. Perform network connection OUTSIDE the lock so other threads are never blocked
+    if should_create:
         try:
-            conn = _connection_pool.get(timeout=5.0)
-        except queue.Empty:
-            # Fallback to creating a transient connection
-            return _create_raw_connection(), False
-            
-    return conn, True
+            conn = _create_raw_connection()
+            return conn, True
+        except Exception as e:
+            with _pool_lock:
+                _created_connections = max(0, _created_connections - 1)
+            # Try getting one that another thread might have returned while we failed
+            try:
+                conn = _connection_pool.get(timeout=3.0)
+                return conn, True
+            except queue.Empty:
+                raise e
+
+    # 4. If pool is at capacity, wait up to 4s for an existing connection to return
+    try:
+        conn = _connection_pool.get(timeout=4.0)
+        return conn, True
+    except queue.Empty:
+        # Fallback to creating a transient connection
+        return _create_raw_connection(), False
 
 
 def _return_connection(conn, is_pooled, is_broken=False):

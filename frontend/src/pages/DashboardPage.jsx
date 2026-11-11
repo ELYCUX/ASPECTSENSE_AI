@@ -188,7 +188,7 @@ export default function DashboardPage() {
               </div>
               <div className="xl:col-span-4 flex flex-col gap-6">
                 {/* Product Health Card */}
-                {loading ? (
+                {loading || !stats ? (
                   <div className="card p-6 flex-1 flex flex-col justify-center animate-pulse space-y-4">
                     <div className="h-4 bg-surface-700/60 rounded w-1/3"></div>
                     <div className="h-3 bg-surface-700/40 rounded w-1/2"></div>

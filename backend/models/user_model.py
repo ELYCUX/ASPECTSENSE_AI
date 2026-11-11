@@ -98,7 +98,12 @@ class UserModel:
                 u.created_at, 
                 u.updated_at,
                 (SELECT COUNT(*) FROM products p WHERE p.user_id = u.id) as products_count,
-                (SELECT COUNT(*) FROM reviews r WHERE r.user_id = u.id) as reviews_count,
+                (
+                    SELECT COUNT(DISTINCT r.id) 
+                    FROM reviews r 
+                    LEFT JOIN products p ON r.product_id = p.id 
+                    WHERE r.user_id = u.id OR p.user_id = u.id
+                ) as reviews_count,
                 (SELECT COUNT(*) FROM amazon_imports ai WHERE ai.user_id = u.id) as imports_count
             FROM users u
             WHERE 1=1
